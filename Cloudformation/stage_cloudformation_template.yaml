@@ -1,0 +1,928 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Cloudformation template onderzoekstopic
+Parameters:
+  LatestAmiId:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2'
+  InstanceTypeParameter:
+    Type: String
+    Default: t2.micro
+    AllowedValues:
+      - t2.micro
+      - m1.small
+    Description: Enter t2.micro or m1.large. Default is t2.micro.
+Resources:
+  EC2Instance:
+    Type: "AWS::EC2::Instance"
+    Properties:
+      InstanceType:
+        Ref: InstanceTypeParameter
+      ImageId:
+        Ref: LatestAmiId
+      KeyName: "EC2-key"
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      SecurityGroupIds: ["sg-0e9bf2fdda3b2de7f"]
+      Tags:
+        - Key: "Name"
+          Value: "Webserver-CF"
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          sudo amazon-linux-extras install -y nginx1
+          sudo systemctl start nginx
+          sudo systemctl enable nginx
+
+          mkdir /root/scripts
+
+          << EOF > /root/scripts/logs_to_s3.sh
+          #!/bin/bash
+          bucket_name='stage-demo-nfuse-cf1.453882275279'
+          path_to_file='Logs';
+          filename='error.log';
+
+          if [ -s /var/log/nginx/error.log ]
+          then
+                  #move error.log to s3 bucket
+                  aws s3 cp /var/log/nginx/error.log s3://$bucket_name/$path_to_file/$filename
+
+                  #make error.log empty
+                  > /var/log/nginx/error.log
+          else
+                  echo "File is empty"
+          fi
+          EOF
+
+          chmod u+x /root/scripts/logs_to_s3.sh
+          crontab<<EOF
+          0 8,12,16,20,0 * * * /root/scripts/logs-to-s3.sh
+          EOF
+  IamRoleEC2:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName: "AllowToEC2-CF"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+                - 'sts:AssumeRole'
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+  EC2InstanceProfile:
+    Type: "AWS::IAM::InstanceProfile"
+    Properties:
+      InstanceProfileName: "EC2Profile-CF"
+      Path: "/"
+      Roles:
+        - !Ref IamRoleEC2
+
+  #ATHENA
+
+  Athena:
+    Type: "AWS::Glue::Database"
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Description: "Database made by CF"
+        Name: "mylogscf"
+
+  AthenaTable:
+    DependsOn: Athena
+    Type: "AWS::Glue::Table"
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: "mylogscf"
+      TableInput:
+        Description: "Table made by CF"
+        Name: "raw_logs_nginxcf"
+        TableType: EXTERNAL_TABLE
+        StorageDescriptor:
+          OutputFormat: "org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat"
+          InputFormat: "org.apache.hadoop.mapred.TextInputFormat"
+          Location: "s3://stage-demo-nfuse-cf1.453882275279/Logs/"
+          SerdeInfo:
+            Parameters:
+              input.regex: "(\\d{4}\\/\\d{2}\\/\\d{2} \\d{2}:\\d{2}:\\d{2})\\s(\\[\\w*\\])\\s(\\d+\\#\\d+):\\s(.*)"
+              serialization.format: 1
+            SerializationLibrary: "org.apache.hadoop.hive.serde2.RegexSerDe"
+          Columns:
+            - Name: "timestamp"
+              Type: "string"
+            - Name: "error_type"
+              Type: "string"
+            - Name: "pid_tid"
+              Type: "string"
+            - Name: "message"
+              Type: "string"
+
+  #CREATING S3 BUCKET & first Lambda to trigger with iam role
+
+  DynamoDBiamRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName: "AmazonLambdaRegistrationLogsCF"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      ManagedPolicyArns:
+         - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      Policies:
+        - PolicyName: AllowPutItemDynamoDBCF
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                Resource: "arn:aws:dynamodb:*:*:table/*"
+        - PolicyName: AllowInvokeLambdaCF
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: "*"
+
+  LambdaDynamoDB:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      FunctionName: "lambda_register_dynamodbCF"
+      Description: Registering lambda to dynamodb
+      Handler: "index.lambda_handler"
+      Role: !GetAtt DynamoDBiamRole.Arn
+      Code:
+       ZipFile: !Sub |
+         import json
+         import boto3
+         from datetime import datetime, timedelta
+
+         def lambda_handler(event, context):
+
+             #Get the information of the uploaded logfile
+             for i in event["Records"]:
+                 action = i["eventName"]
+                 ip = i["requestParameters"]["sourceIPAddress"]
+                 bucket_name = i["s3"]["bucket"]["name"]
+                 path = i["s3"]["object"]["key"]
+
+
+             #Split path to get filename
+             split_path = path.split("/")
+             fileName = split_path[1]
+
+
+             #Pass the values into a dictionary
+             objectTrigger = {
+                 "action": action,
+                 "ip": ip,
+                 "bucket_name": bucket_name,
+                 "fileName": fileName
+             }
+
+
+             #execute function to register into DynamoDB
+             put_item_dynamodb(fileName)
+
+             #invoke the Athena query lambda
+             invoke_lambda_function(str(objectTrigger))
+
+
+         def put_item_dynamodb(fileName):
+
+             dynamodb = boto3.client('dynamodb')
+
+             now = (datetime.now() + timedelta(hours=2))
+
+             logsId = now.strftime('%Y%m%d_%H%M%S.%f')
+             regDate = now.strftime("%Y-%m-%d")
+             regTime= now.strftime("%H:%M")
+
+             dynamodb.put_item(TableName='RegistrationLogsCF', Item={'logsId':{'S':logsId},
+             'fileName':{'S':fileName},
+             'registrationDate':{'S':regDate},
+             'registrationTime':{'S':regTime}})
+
+             print('Succesfully added to DB')
+
+         def invoke_lambda_function(context):
+
+             lambda_client = boto3.client('lambda')
+
+             lambda_client.invoke(FunctionName="lambda_queryCF", InvocationType='Event', LogType='None', Payload=json.dumps(context))
+      Timeout: 300
+      MemorySize: 128
+      Runtime: python3.7
+
+  S3Bucket:
+    Type: "AWS::S3::Bucket"
+    DependsOn: BucketPermission
+    Properties:
+      BucketName: "stage-demo-nfuse-cf1.453882275279"
+      AccessControl: "Private"
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: "s3:ObjectCreated:*"
+            Function: !GetAtt LambdaDynamoDB.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: "prefix"
+                    Value: "Logs/"
+                  - Name: "suffix"
+                    Value: ".log"
+
+  BucketPermission:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !Ref LambdaDynamoDB
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: "arn:aws:s3:::stage-demo-nfuse-cf1.453882275279"
+
+    #CREATING LAMBDA FUNCTIONS & IAM ROLES
+  MoveFileiamRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName: "AmazonLambdaMoveLogsCF"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      Policies:
+        - PolicyName: AllowS3MoveLogsCF
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:DeleteObjectTagging
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:GetObjectTagging
+                  - s3:PutObjectTagging
+                  - s3:DeleteObject
+                Resource: "arn:aws:s3:::*/*"
+        - PolicyName: AllowInvokeLambdaCF
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: "*"
+
+  LambdaMoveLogs:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      FunctionName: "lambda_move_logsCF"
+      Description: Moving queried logs to another directory
+      Handler: "index.lambda_handler"
+      Role: !GetAtt MoveFileiamRole.Arn
+      Code:
+        ZipFile: !Sub |
+          import json
+          import boto3
+          from datetime import datetime, timedelta
+
+          def lambda_handler(event, context):
+
+              move_logs_to_queriedlogs(event["bucket_name"], event["fileName"])
+
+
+          def move_logs_to_queriedlogs(bucket_name, fileName):
+
+              now = (datetime.now() + timedelta(hours=2))
+
+              year = now.strftime("%Y")
+              month = now.strftime("%m")
+              day = now.strftime("%d")
+
+              time = now.strftime("%H_%M")
+
+              path_to_queriedlogs = "QueriedLogs/" + str(year) + "/" + str(month) + "/" + str(day) + "/" + str(time) + "/" + fileName
+
+
+              s3_resource = boto3.resource('s3')
+
+              s3_resource.Object(bucket_name, path_to_queriedlogs).copy_from(CopySource=bucket_name + "/Logs/" + fileName)
+
+              s3_resource.Object(bucket_name, "Logs/" + fileName).delete()
+
+      MemorySize: 128
+      Timeout: 300
+      Runtime: python3.7
+
+  QueryIamRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName: "AmazonLambdaQueryCF"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+        - "arn:aws:iam::aws:policy/AmazonS3FullAccess"
+        - "arn:aws:iam::aws:policy/AmazonAthenaFullAccess"
+      Policies:
+        - PolicyName: AllowInvokeLambdaCF
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: "*"
+
+  LambdaQuery:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      FunctionName: "lambda_queryCF"
+      Description: Querying logs with Athena
+      Handler: "index.lambda_handler"
+      Role: !GetAtt QueryIamRole.Arn
+      Code:
+        ZipFile: !Sub |
+          import json
+          import boto3
+          import time
+          from datetime import datetime, timedelta
+
+          DATABASE = "mylogscf"
+          TABLE = "raw_logs_nginxcf"
+          S3_OUTPUT = 's3://stage-demo-nfuse-cf1.453882275279/OutputAthena/'
+          S3_BUCKET = 'stage-demo-nfuse-cf1.453882275279'
+          RETRY_COUNT = 20
+
+
+          def lambda_handler(event, context):
+
+              #Load previous info from the lambda
+              tempstr = str(event).replace("\'", "\"")
+              objectTrigger = json.loads(tempstr)
+
+
+              #Execute query
+              result = query_logs()
+
+
+              #Count for errors and save into objectTrigger
+              count_rows = len(result['ResultSet']['Rows'])
+
+              if count_rows == 1:
+                  return "No errors found"
+
+              objectTrigger['errorsFound'] = count_rows - 1
+
+              resultTrigger = {
+                  "bucket_name": objectTrigger["bucket_name"],
+                  "result": result['ResultSet']['Rows'],
+                  "fileName": objectTrigger["fileName"]
+              }
+
+
+              #Invoke lambdas
+              invoke_lambda_save_json(resultTrigger)
+
+
+              invoke_lambda_sns(objectTrigger)
+
+
+          def execute_query_athena(query):
+              client = boto3.client('athena')
+
+              response = client.start_query_execution(
+                  QueryString=query,
+                  QueryExecutionContext={
+                      'Database': DATABASE
+                  },
+                  ResultConfiguration={
+                      'OutputLocation': S3_OUTPUT,
+                  }
+              )
+
+              query_execution_id = response['QueryExecutionId']
+
+              for i in range(1,1 + RETRY_COUNT):
+
+                  query_status = client.get_query_execution(QueryExecutionId=query_execution_id)
+                  query_execution_status = query_status['QueryExecution']['Status']['State']
+
+                  if query_execution_status == 'SUCCEEDED':
+                      print("STATUS:" + query_execution_status + " - " + query_execution_id)
+
+                      result = client.get_query_results(QueryExecutionId=query_execution_id)
+                      return result
+
+                  if query_execution_status == 'FAILED':
+                      raise Exception("STATUS:" + query_execution_status)
+
+                  else:
+                      print("STATUS:" + query_execution_status + " - " + query_execution_id)
+                      time.sleep(i)
+
+              client.stop_query_execution(QueryExecutionId=query_execution_id)
+              raise Exception('TIME OVER')
+
+
+          def query_logs():
+
+              query = "SELECT * FROM " + DATABASE + "." + TABLE + " WHERE error_type LIKE '%error%'"
+              print(query)
+              result = execute_query_athena(query)
+
+              return result
+
+
+          def invoke_lambda_save_json(context):
+              lambda_client = boto3.client('lambda')
+
+              lambda_client.invoke(FunctionName="lambda_save_jsonCF",
+              InvocationType='Event',
+              LogType='None',
+              Payload=json.dumps(context))
+
+
+          def invoke_lambda_sns(context):
+
+              lambda_client = boto3.client('lambda')
+
+              lambda_client.invoke(FunctionName="lambda_sns_publishCF",
+              InvocationType='Event',
+              LogType='None',
+              Payload=json.dumps(context))
+
+      MemorySize: 128
+      Timeout: 300
+      Runtime: python3.7
+
+
+  SNSIamRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName: "AmazonLambdaPublishSNSCF"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+               - lambda.amazonaws.com
+            Action:
+             - 'sts:AssumeRole'
+      Path: /
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      Policies:
+        - PolicyName: AllowInvokeLambdaCF
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: "*"
+        - PolicyName: AllowSNSPublishCF
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: "arn:aws:sns:*:*:*"
+  LambdaSNS:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      FunctionName: "lambda_sns_publishCF"
+      Description: Publish e-mail to notify about errors
+      Handler: "index.lambda_handler"
+      Role: !GetAtt SNSIamRole.Arn
+      Code:
+        ZipFile: !Sub |
+          import json
+          import boto3
+          from datetime import datetime
+
+          TOPIC_ARN = "arn:aws:sns:eu-west-1:453882275279:NotifyLogsCF"
+
+          def lambda_handler(event, context):
+
+              #create subject and body
+              subject, body = create_subject_and_body(event)
+
+
+              # publishing topic for email notification
+              publish_topic(subject, body)
+
+              #invoking lambda to move logs
+              invoke_lambda_move_logs(event)
+
+          def create_subject_and_body(event):
+
+              s= datetime.now().strftime('%Y/%m/%d')
+
+              path_to_structured = "s3://" + event["bucket_name"] + "/StructuredAthena/" + str(s)
+
+
+              # Creating subject & body for email
+              subject = str(event["action"]) + "Event from " + event["bucket_name"]
+
+
+              body = """
+              This email is to notify you regarding {} event,
+              Source IP: {},
+              FileName: {},
+              This file has {} error(s),
+              Please go to {} for a structured view of the errors.
+              """.format(event["action"], event["ip"],
+              event["fileName"],
+              event["errorsFound"],
+              path_to_structured)
+
+              return subject, body
+
+          def publish_topic(subject, body):
+
+              client = boto3.client("sns")
+
+              client.publish(
+                  TopicArn = TOPIC_ARN,
+                  Subject = subject,
+                  Message=body
+              )
+
+          def invoke_lambda_move_logs(context):
+              lambda_client = boto3.client('lambda')
+
+              lambda_client.invoke(FunctionName="lambda_move_logsCF",
+              InvocationType='Event',
+              LogType='None',
+              Payload=json.dumps(context))
+      MemorySize: 128
+      Timeout: 300
+      Runtime: python3.7
+
+  SaveJSONIamRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName: "AmazonLambdaSaveJSONCF"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      Policies:
+        - PolicyName: AllowInvokeLambdaCF
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: "*"
+        - PolicyName: AllowS3PutItemCF
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource: "arn:aws:s3:::*/*"
+  LambdaSaveJSON:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      FunctionName: "lambda_save_jsonCF"
+      Description: Save query result in JSON
+      Handler: "index.lambda_handler"
+      Role: !GetAtt SaveJSONIamRole.Arn
+      Code:
+        ZipFile: !Sub |
+          import json
+          import boto3
+          from datetime import datetime, timedelta
+
+          def lambda_handler(event, context):
+
+
+              save_file_to_s3(event["fileName"], event["result"], event["bucket_name"])
+
+
+          def save_file_to_s3(fileName, result, bucket_name):
+
+              s = (datetime.now() + timedelta(hours=2)).strftime('%Y/%m/%d/%H:%M:%S.%f')
+
+              split_file = fileName.split(".")
+
+              file_name = str(s) + "-" + split_file[0]
+
+              file_path = 'StructuredAthena/' + file_name + '.json'
+
+              s3 = boto3.resource("s3").Bucket(bucket_name)
+
+
+              json.dump_s3 = lambda obj, f: s3.Object(key=f).put(Body=json.dumps(obj))
+              json.dump_s3(result, file_path)
+      MemorySize: 128
+      Timeout: 300
+      Runtime: python3.7
+
+  #CREATING SNS
+
+  SNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: NotifyLogsCF
+      Subscription:
+        - Endpoint: "gokhan.tabu@student.pxl.be"
+          Protocol: "email"
+
+  #CREATING DYNAMODB
+
+  DynamoDB:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: "RegistrationLogsCF"
+      BillingMode: "PROVISIONED"
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+      AttributeDefinitions:
+        - AttributeName: "logsId"
+          AttributeType: "S"
+        - AttributeName: "fileName"
+          AttributeType: "S"
+        - AttributeName: "registrationDate"
+          AttributeType: "S"
+      KeySchema:
+        - AttributeName: "logsId"
+          KeyType: "HASH"
+
+      GlobalSecondaryIndexes:
+        - IndexName: "fileName-index"
+          KeySchema:
+            - AttributeName: "fileName"
+              KeyType: "HASH"
+          ProvisionedThroughput:
+            ReadCapacityUnits: 5
+            WriteCapacityUnits: 5
+          Projection:
+            ProjectionType: "ALL"
+
+        - IndexName: "registrationDate-index"
+          KeySchema:
+            - AttributeName: "registrationDate"
+              KeyType: "HASH"
+          ProvisionedThroughput:
+            ReadCapacityUnits: 5
+            WriteCapacityUnits: 5
+          Projection:
+            ProjectionType: "ALL"
+
+
+  #CREATING API-GATEWAY IAM & API-GATEWAY
+
+  ApiGatewayIamRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName: "AmazonAPIGatewayQueryDynamoDBCF"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - apigateway.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs"
+      Policies:
+        - PolicyName: AllowDynamoDBQueryCF
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "dynamodb:Query"
+                Resource: "arn:aws:dynamodb:*:*:table/*/index/*"
+
+              - Effect: Allow
+                Action:
+                  - "dynamodb:Query"
+                Resource: "arn:aws:dynamodb:*:*:table/*"
+
+  MyAPI:
+    Type: "AWS::ApiGateway::RestApi"
+    Properties:
+      Name: "LogsApiCF"
+      Description: "Retrieve records from DynamoDB - CF"
+      EndpointConfiguration:
+        Types:
+          - "REGIONAL"
+
+  MyResourceLogs:
+    Type: "AWS::ApiGateway::Resource"
+    Properties:
+      ParentId: !GetAtt MyAPI.RootResourceId
+      RestApiId: !Ref MyAPI
+      PathPart: "logs"
+
+  MyResourcesFileName:
+    Type: "AWS::ApiGateway::Resource"
+    Properties:
+      ParentId: !Ref MyResourceLogs
+      RestApiId: !Ref MyAPI
+      PathPart: "{filename}"
+
+  MyResourceLogsD:
+    Type: "AWS::ApiGateway::Resource"
+    Properties:
+      ParentId: !GetAtt MyAPI.RootResourceId
+      RestApiId: !Ref MyAPI
+      PathPart: "logsd"
+
+  MyResourcesLogsDate:
+    Type: "AWS::ApiGateway::Resource"
+    Properties:
+      ParentId: !Ref MyResourceLogsD
+      RestApiId: !Ref MyAPI
+      PathPart: "{date}"
+
+  MyGetMethod:
+    Type: "AWS::ApiGateway::Method"
+    Properties:
+      RestApiId: !Ref MyAPI
+      ResourceId: !Ref MyResourcesFileName
+      HttpMethod: "GET"
+      AuthorizationType: "NONE"
+      ApiKeyRequired: true
+      Integration:
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseTemplates:
+              application/json: |
+                #set($inputRoot = $input.path('$'))
+                {
+                    "found logs by filename": [
+                        #foreach($elem in $inputRoot.Items) {
+                            "Registration date": "$elem.registrationDate.S",
+                            "Registration time": "$elem.registrationTime.S",
+                            "Filename": "$elem.fileName.S"
+                        }#if($foreach.hasNext),#end
+                #end
+                    ]
+                }
+        IntegrationHttpMethod: "POST"
+        Type: "AWS"
+        Uri: "arn:aws:apigateway:eu-west-1:dynamodb:action/Query"
+        Credentials: !GetAtt ApiGatewayIamRole.Arn
+        PassthroughBehavior: "WHEN_NO_TEMPLATES"
+        RequestTemplates:
+          application/json: |
+            {
+                "TableName": "RegistrationLogsCF",
+                "IndexName": "fileName-index",
+                "KeyConditionExpression": "fileName = :v1",
+                "ExpressionAttributeValues": {
+                    ":v1": {
+                        "S": "$input.params('filename')"
+                    }
+                }
+            }
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: "Empty"
+
+
+  MyGetMethodD:
+    Type: "AWS::ApiGateway::Method"
+    Properties:
+      RestApiId: !Ref MyAPI
+      ResourceId: !Ref MyResourcesLogsDate
+      HttpMethod: "GET"
+      AuthorizationType: "NONE"
+      ApiKeyRequired: true
+      Integration:
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseTemplates:
+              application/json: |
+                #set($inputRoot = $input.path('$'))
+                {
+                    "found logs by date": [
+                        #foreach($elem in $inputRoot.Items) {
+                            "Registration date": "$elem.registrationDate.S",
+                            "Registration time": "$elem.registrationTime.S",
+                            "Filename": "$elem.fileName.S"
+                        }#if($foreach.hasNext),#end
+                #end
+                    ]
+                }
+        IntegrationHttpMethod: "POST"
+        Type: "AWS"
+        Uri: "arn:aws:apigateway:eu-west-1:dynamodb:action/Query"
+        Credentials: !GetAtt ApiGatewayIamRole.Arn
+        PassthroughBehavior: "WHEN_NO_TEMPLATES"
+        RequestTemplates:
+          application/json: |
+            {
+                "TableName": "RegistrationLogsCF",
+                "IndexName": "registrationDate-index",
+                "KeyConditionExpression": "registrationDate = :v1",
+                "ExpressionAttributeValues": {
+                    ":v1": {
+                        "S": "$input.params('date')"
+                    }
+                }
+            }
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: "Empty"
+  MyApiStage:
+    Type: "AWS::ApiGateway::Stage"
+    Properties:
+      DeploymentId: !Ref MyDeployment
+      StageName: "LATEST"
+      RestApiId: !Ref MyAPI
+
+  MyDeployment:
+    Type: "AWS::ApiGateway::Deployment"
+    DependsOn:
+      - MyGetMethodD
+      - MyGetMethod
+    Properties:
+      RestApiId: !Ref MyAPI
+      StageName: "Production"
+
+  MyApiKey:
+    Type: "AWS::ApiGateway::ApiKey"
+    Properties:
+      Name: "MY_API_KEY_CF"
+      Description: "API key to allow retrieve records from DynamoDB"
+
+  MyUsagePlan:
+    Type: "AWS::ApiGateway::UsagePlan"
+    DependsOn:
+      - MyDeployment
+    Properties:
+      UsagePlanName: "Plan_DynamoDBCF"
+      ApiStages:
+        - ApiId: !Ref MyAPI
+          Stage: !Ref MyApiStage
+      Quota:
+        Limit: 5000
+        Period: MONTH
+      Throttle:
+        BurstLimit: 200
+        RateLimit: 100
+
+  MyUsagePlanKey:
+    DependsOn:
+      - MyUsagePlan
+    Type: "AWS::ApiGateway::UsagePlanKey"
+    Properties:
+      KeyId: !Ref MyApiKey
+      KeyType: "API_KEY"
+      UsagePlanId: !Ref MyUsagePlan
+
+
+
+
+
